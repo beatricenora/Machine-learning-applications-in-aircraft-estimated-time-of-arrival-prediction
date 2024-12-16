@@ -1,0 +1,295 @@
+# import libraries 
+import dask.dataframe as dd
+import glob
+import os
+from google.colab import drive
+from pyproj import Geod
+import logging
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import GridSearchCV, train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# mount Google Drive
+drive.mount('/content/drive')
+
+# folder path 
+folder_path = '/content/drive/MyDrive/TESI/EGKK_202407/'
+
+# function to calculate Haversine distance 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    geod = Geod(ellps="WGS84")
+    distances = []
+    for la1, lo1, la2, lo2 in zip(lat1, lon1, lat2, lon2):
+        _, _, distance = geod.inv(lo1, la1, lo2, la2)
+        distances.append(distance / 1852)  # Conversione in miglia nautiche
+    return distances
+
+# function to process parquet files 
+def process_parquet_files(parquet_files, airport_lat, airport_lon):
+    dataset = []
+    flight_count = 0
+    skipped_count = 0
+
+    for file in parquet_files:
+        df = pd.read_parquet(file)
+
+        for callsign, group in df.groupby('callsign'):
+            group = group.sort_values('time')
+            group['distance_to_airport'] = haversine_distance(group['lat'].values, group['lon'].values, [airport_lat]*len(group), [airport_lon]*len(group))
+            entry_index = group[(group['distance_to_airport'] <= 100) & (group['distance_to_airport'] >= 48)].index.min()
+
+            if pd.isna(entry_index):
+                skipped_count += 1
+                continue
+
+            entry_row = group.loc[entry_index]
+            lowest_baroaltitude = group['baroaltitude'].min()
+            arrival_time = group[group['baroaltitude'] == lowest_baroaltitude]['time'].iloc[0]
+            transit_time = arrival_time - entry_row['time']
+
+            features = entry_row[['lat', 'lon', 'velocity', 'heading', 'vertrate', 'baroaltitude', 'geoaltitude', 'hour']].to_dict()
+
+            dataset.append({
+                'callsign': callsign,
+                'icao24': entry_row['icao24'],
+                **features,
+                'arrival_time': arrival_time,
+                'transit_time': transit_time
+            })
+            flight_count += 1
+
+    logging.info(f"Processed {flight_count} flights, skipped {skipped_count} flights.")
+    logging.info(f"Total flights processed: {len(dataset)}")
+    return pd.DataFrame(dataset)
+
+# logging set up
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# EGKK (Gatwick) airport coordinates
+airport_lat, airport_lon = 51.1537, -0.1821
+
+# all the files in the folder 
+parquet_files = glob.glob(folder_path + '*.parquet')
+
+# process files in batch 
+batch_size = 5
+all_results = []
+
+for i in range(0, len(parquet_files), batch_size):
+    batch_files = parquet_files[i:i + batch_size]
+    logging.info(f"Processing batch {i // batch_size + 1}/{len(parquet_files) // batch_size + 1}")
+    result_df = process_parquet_files(batch_files, airport_lat, airport_lon)
+    all_results.append(result_df)
+    del result_df
+
+# results concat 
+final_result_df = pd.concat(all_results, ignore_index=True)
+
+# saving the results in a CSV file 
+output_file = '/content/drive/MyDrive/TESI/flight_dataset_all_50.csv'
+logging.info(f"Saving results to {output_file}")
+final_result_df.to_csv(output_file, index=False)
+logging.info("Processing completed")
+
+# conversion and data cleaning 
+if 'arrival_time' in final_result_df.columns:
+    final_result_df['arrival_time'] = pd.to_datetime(final_result_df['arrival_time'])
+
+try:
+    final_result_df['hour'] = pd.to_datetime(final_result_df['hour'], errors='coerce')
+    final_result_df['hour'] = final_result_df['hour'].dt.tz_localize(None)
+    final_result_df['hour'] = (final_result_df['hour'] - pd.Timestamp("1970-01-01")) / pd.Timedelta('1s')
+    final_result_df['hour'] = final_result_df['hour'].astype(np.float64)
+except Exception as e:
+    logging.error(f"Errore nella conversione di 'hour': {e}")
+
+try:
+    final_result_df['transit_time'] = pd.to_timedelta(final_result_df['transit_time'].astype(str), errors='coerce')
+    final_result_df['transit_time'] = final_result_df['transit_time'].dt.total_seconds()
+except Exception as e:
+    logging.error(f"Errore nella conversione di 'transit_time': {e}")
+
+for col in ['lat', 'lon', 'velocity', 'heading', 'vertrate', 'baroaltitude']:
+    try:
+        final_result_df[col] = pd.to_numeric(final_result_df[col], errors='coerce')
+    except Exception as e:
+        logging.error(f"Errore nella conversione di {col}: {e}")
+
+final_result_df = final_result_df.dropna()
+
+# training and evaluation 
+if not final_result_df.empty:
+    labels = final_result_df['transit_time']
+    features = final_result_df.drop(['callsign', 'time', 'transit_time'], axis=1, errors='ignore')
+
+    for col in features.select_dtypes(include=['datetime64[ns, UTC]']).columns:
+        features[col] = features[col].astype('int64')
+
+    features = features.select_dtypes(include=np.number)
+    features = features.dropna(axis=1, how='all')
+    features = features.dropna(axis=0, how='all')
+
+    if features.empty:
+        logging.error("Features DataFrame is empty. Check your filtering or data.")
+    else:
+        imputer = SimpleImputer(strategy='mean')
+        features = pd.DataFrame(imputer.fit_transform(features), columns=features.columns)
+
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+
+        train_features, test_features, train_labels, test_labels = train_test_split(features_scaled, labels, test_size=0.25, random_state=42)
+
+        param_grid = {
+            'fit_intercept': [True, False],
+            'copy_X': [True, False]
+        }
+
+        lr = LinearRegression()
+        grid_search = GridSearchCV(estimator=lr, param_grid=param_grid, cv=5, scoring='neg_mean_absolute_error')
+
+        grid_search.fit(train_features, train_labels)
+
+        print(f'Best parameters: {grid_search.best_params_}')
+
+        cv_scores = cross_val_score(lr, train_features, train_labels, cv=5, scoring='neg_mean_absolute_error')
+        cv_mean = -np.mean(cv_scores)
+        print(f'Cross-Validated MAE: {cv_mean:.2f}')
+
+        best_lr = grid_search.best_estimator_
+        predictions = best_lr.predict(test_features)
+
+        mae = mean_absolute_error(test_labels, predictions)
+        print('Mean Absolute Error:', mae)
+
+        mse = mean_squared_error(test_labels, predictions)
+        print('Mean Squared Error:', mse)
+
+        rmse = np.sqrt(mse)
+        print('Root Mean Squared Error:', rmse)
+
+        r2 = r2_score(test_labels, predictions)
+        print('R^2 Score:', r2)
+
+        non_zero_test_labels = test_labels != 0
+        mape = 100 * (abs(predictions[non_zero_test_labels] - test_labels[non_zero_test_labels]) / test_labels[non_zero_test_labels])
+        accuracy = 100 - np.mean(mape)
+        print('Accuracy:', round(accuracy, 2), '%.')
+        # feature importance 
+        feature_names = final_result_df.drop(['callsign', 'time', 'transit_time'], axis=1, errors='ignore').columns.tolist()
+        importances = best_lr.coef_
+        importances = abs(importances)
+
+        if len(feature_names) != len(importances):
+          feature_names = feature_names[:len(importances)]
+
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': importances
+        })
+        importance_df = importance_df.sort_values(by='Importance', ascending=False)
+
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x='Importance', y='Feature', data=importance_df.nlargest(10, 'Importance'))
+        plt.title('Feature Importances')
+        plt.show()
+
+        # scatter plot: prediction vs actual value 
+        plt.figure(figsize=(12, 6))
+        plt.scatter(test_labels, predictions, alpha=0.3)
+        plt.plot([test_labels.min(), test_labels.max()], [test_labels.min(), test_labels.max()], 'r--')
+        plt.xlabel('Valori Reali')
+        plt.ylabel('Valori Previsti')
+        plt.title('Valori Reali vs Valori Previsti')
+        plt.show()
+
+        # scatter plot: prediction errors 
+        errors = predictions - test_labels
+        plt.figure(figsize=(12, 6))
+        sns.histplot(errors, kde=True, bins=30)
+        plt.title('Distribuzione degli Errori di Previsione')
+        plt.xlabel('Errore')
+        plt.ylabel('Frequenza')
+        plt.show()
+
+        # model graph
+        def plot_the_model(model, X, y):
+            plt.figure(figsize=(10, 6))
+            plt.scatter(X[:, 0], y, color='blue', label='Valori Reali')  # Considera solo la prima caratteristica per la visualizzazione
+            plt.plot(X[:, 0], model.predict(X), color='red', linewidth=2, label='Predizioni del modello')
+            plt.xlabel('Prima caratteristica (scalata)')
+            plt.ylabel('Tempo')
+            plt.legend()
+            plt.show()
+
+        # loss curve 
+        def plot_the_loss_curve(y_true, y_pred):
+            errors = y_true - y_pred
+            plt.figure(figsize=(10, 6))
+            plt.hist(errors, bins=50)
+            plt.xlabel('Errore di Predizione')
+            plt.ylabel('Frequenza')
+            plt.show()
+
+        plot_the_model(best_lr, test_features, test_labels)
+        plot_the_loss_curve(test_labels, predictions)
+
+        # boxplot: prediction errors 
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x=errors)
+        plt.title('Distribuzione degli Errori di Previsione')
+        plt.xlabel('Errore')
+        plt.show()
+
+        # violin plot: prediction errors 
+        plt.figure(figsize=(10, 6))
+        sns.violinplot(x=errors)
+        plt.title('Distribuzione degli Errori di Previsione (Violin Plot)')
+        plt.xlabel('Errore')
+        plt.show()
+
+        # scatter plot: velocity wise
+        plt.figure(figsize=(10, 6))
+        plt.scatter(test_features[:, 2], errors, alpha=0.5)  # test_features[:, 2] è la velocità
+        plt.xlabel('Velocità')
+        plt.ylabel('Errore di Predizione')
+        plt.title('Errore vs Velocità')
+        plt.show()
+
+        # scatter plot: baroaltitude wise 
+        plt.figure(figsize=(10, 6))
+        plt.scatter(test_features[:, 5], errors, alpha=0.5)  # test_features[:, 5] è baroaltitude
+        plt.xlabel('Altitudine Barometrica')
+        plt.ylabel('Errore di Predizione')
+        plt.title('Errore vs Altitudine Barometrica')
+        plt.show()
+
+        # features correlation heatmap 
+        plt.figure(figsize=(12, 8))
+        correlation_matrix = pd.DataFrame(train_features, columns=feature_names).corr()
+        sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt='.2f')
+        plt.title('Matrice di Correlazione delle Feature')
+        plt.show()
+
+        # residual graph 
+        plt.figure(figsize=(10, 6))
+        sns.residplot(x=test_labels, y=errors, lowess=True, color="blue", line_kws={'color': 'red', 'lw': 1})
+        plt.title('Residual Plot')
+        plt.xlabel('Valori Reali')
+        plt.ylabel('Residui')
+        plt.show()
+
+        # performance in cross-validation
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(cv_scores) + 1), -cv_scores, marker='o', linestyle='--', color='b', label='CV MAE')
+        plt.xlabel('Fold')
+        plt.ylabel('MAE')
+        plt.title('Performance del modello durante la Cross-Validation')
+        plt.legend()
+        plt.show()
