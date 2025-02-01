@@ -191,7 +191,7 @@ if __name__ == "__main__":
             'model__max_depth': [None, 10, 20, 30],
             'model__min_samples_split': [2, 5, 10],
             'model__min_samples_leaf': [1, 2, 4],
-            'model__max_features': ['auto', 'sqrt', 'log2'],
+            'model__max_features': [1.0, 'sqrt', 'log2'],
             'model__ccp_alpha': [0.0, 0.01, 0.1],
     }
 
