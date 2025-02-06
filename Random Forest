@@ -325,7 +325,7 @@ if __name__ == "__main__":
     # features correlation heatmap
     plt.figure(figsize=(12, 8))
     correlation_matrix = pd.DataFrame(train_features, columns=['lat',
-                'lon', 'velocity', 'heading', 'vertrate', 'baroaltitude', 'geoaltitude', 'hour']).corr()
+                'lon', 'velocity', 'heading', 'vertrate', 'baroaltitude', 'geoaltitude']).corr()
     sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt='.2f')
     plt.title('Matrice di Correlazione delle Feature')
     plt.show()
