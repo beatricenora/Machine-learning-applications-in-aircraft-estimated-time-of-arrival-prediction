@@ -1,0 +1,25 @@
+# if the codes are run on more than one dataset,
+# it's better to read the values from the graphs already plotted
+# and note them below to draw a graph of the mean results,
+# so the results are better readable 
+
+# feature importance
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Dati
+features = ['lat','velocity','heading','lon','geoaltitude','baroaltitude','vertrate']
+mean_importance = [5787.5,5143.75,3637.5,3350,3237.5,3187.5,3000]
+
+# Creazione del grafico a barre
+plt.figure(figsize=(10, 6))
+plt.bar(features, mean_importance, color='skyblue')
+plt.xlabel('Feature')
+plt.ylabel('Media Importanza')
+plt.title('Importanza delle Feature (Media Giugno-Settembre)')
+plt.xticks(rotation=45)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Mostra il grafico
+plt.tight_layout()
+plt.show()
